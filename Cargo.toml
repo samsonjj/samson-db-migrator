@@ -6,5 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-postgres = "0.19.4"
+chrono = "0.4.22"
+clap = { version = "4.0.10", features = ["derive"] }
+colored = "2.0.0"
+itertools = "0.10.5"
+postgres = { version = "0.19.4", features = ["with-chrono-0_4"] }
 rpassword = "7.0.0"

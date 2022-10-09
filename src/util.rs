@@ -1,6 +1,9 @@
 use std::fmt::Display;
+use std::io::prelude::*;
 
-pub fn print_vec<'a, T>(x: Box<dyn Iterator<Item = T> + 'a>)
+use colored::Colorize;
+
+pub fn print_iter<'a, T>(x: Box<dyn Iterator<Item = T> + 'a>)
 where
     T: Display,
 {
@@ -13,4 +16,10 @@ where
         }
     }
     println!("\n]");
+}
+
+pub fn ask_password() -> String {
+    println!("Enter db password:");
+    std::io::stdout().flush().unwrap();
+    rpassword::read_password().unwrap()
 }
