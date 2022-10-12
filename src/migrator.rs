@@ -1,11 +1,11 @@
+use chrono::{Date, DateTime, Utc};
+use itertools::Itertools;
+use std::collections::{hash_map::Entry, HashMap};
 use std::env;
 use std::fmt::Display;
 use std::fs::{self, FileType};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::collections::{HashMap, hash_map::Entry};
-use chrono::{DateTime, Utc, Date};
-use itertools::Itertools;
 
 use colored::Colorize;
 
@@ -25,27 +25,17 @@ pub struct MetadataRow {
 macro_rules! row_format {
     () => {
         "{0: <30} | {1: <30} | {2: <10}"
-    }
+    };
 }
 
 impl MetadataRow {
     pub fn print_headers() {
         println!();
-        println!(
-            row_format!(),
-            "ts",
-            "filename",
-            "checksum",
-        );
+        println!(row_format!(), "ts", "filename", "checksum",);
         println!("------------------------------------------------------------------------------------------");
     }
     pub fn print_row(&self) {
-        println!(
-            row_format!(),
-            self.ts,
-            self.filename,
-            self.checksum
-        );
+        println!(row_format!(), self.ts, self.filename, self.checksum);
     }
 }
 
@@ -59,16 +49,20 @@ pub struct FileData {
 
 impl FileData {
     pub fn get_map(paths: &Vec<PathBuf>) -> HashMap<String, Self> {
-        paths.iter().map(|path| 
-            (
-                path.file_name().unwrap().to_str().unwrap().to_owned(),
-                FileData {
-                    checksum: 0,
-                    filename: path.file_name().unwrap().to_str().unwrap().to_owned(),
-                    path: path.clone(),
-                    ts: Utc::now(),
-                }
-            )).collect()
+        paths
+            .iter()
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_str().unwrap().to_owned(),
+                    FileData {
+                        checksum: 0,
+                        filename: path.file_name().unwrap().to_str().unwrap().to_owned(),
+                        path: path.clone(),
+                        ts: Utc::now(),
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -86,18 +80,22 @@ impl Metadata {
         ";
         let rows = client.query(query, &[])?;
 
-        let rows = rows.iter().map(|row| {
-            MetadataRow {
+        let rows = rows
+            .iter()
+            .map(|row| MetadataRow {
                 ts: rows[0].get::<_, DateTime<Utc>>(0),
                 filename: row.get(1),
                 checksum: row.get::<_, i64>(2) as i32,
-            }
-        }).collect();
+            })
+            .collect();
         Ok(Self { rows })
     }
 
     pub fn as_map(&self) -> HashMap<String, MetadataRow> {
-        self.rows.iter().map(|row| (row.filename.clone(), row.clone())).collect()
+        self.rows
+            .iter()
+            .map(|row| (row.filename.clone(), row.clone()))
+            .collect()
     }
 
     pub fn init_metadata_table(client: &mut postgres::Client) -> Result<(), postgres::Error> {
@@ -133,34 +131,57 @@ pub struct Migrator {
     directory: PathBuf,
 }
 
+enum MigrationStatus {
+    Migrated,
+    Unmigrated,
+    FileMissing,
+}
 
 struct MetadataComparison {
     filename: String,
     table_row: Option<MetadataRow>,
     filesystem: Option<FileData>,
+    status: Option<MigrationStatus>,
 }
 
 impl MetadataComparison {
     fn new(filename: String) -> Self {
-        Self { filename, table_row: None, filesystem: None }
+        Self {
+            filename,
+            table_row: None,
+            filesystem: None,
+            status: None,
+        }
     }
 }
 
-fn gen_comparisons(filedata: HashMap<String, FileData>, metadata: HashMap<String, MetadataRow>) -> Vec<MetadataComparison> {
+fn gen_comparisons(
+    filedata: HashMap<String, FileData>,
+    metadata: HashMap<String, MetadataRow>,
+) -> Vec<MetadataComparison> {
     let mut hm: HashMap<String, MetadataComparison> = HashMap::new();
     for (filename, data) in filedata {
-        let entry = hm.entry(filename.clone()).or_insert(MetadataComparison::new(filename.clone()));
+        let entry = hm
+            .entry(filename.clone())
+            .or_insert(MetadataComparison::new(filename.clone()));
         (*entry).filesystem = Some(data);
     }
     for (filename, data) in metadata {
-        let entry = hm.entry(filename.clone()).or_insert(MetadataComparison::new(filename.clone()));
+        let entry = hm
+            .entry(filename.clone())
+            .or_insert(MetadataComparison::new(filename.clone()));
         (*entry).table_row = Some(data);
     }
 
-    let keys = hm.keys().sorted().map(|k| k.clone()).collect::<Vec<String>>();
-    keys.iter().map(|k| hm.remove(k).unwrap()).collect::<Vec<_>>()
+    let keys = hm
+        .keys()
+        .sorted()
+        .map(|k| k.clone())
+        .collect::<Vec<String>>();
+    keys.iter()
+        .map(|k| hm.remove(k).unwrap())
+        .collect::<Vec<_>>()
 }
-
 
 impl Migrator {
     pub fn new() -> Result<Self, io::Error> {
@@ -169,7 +190,46 @@ impl Migrator {
         })
     }
 
-    pub fn do_migration(&self, client: &mut postgres::Client) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn do_checks(
+        &self,
+        client: &mut postgres::Client,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let files = self.get_sorted_target_files()?;
+
+        let metadata = Metadata::from_postgres_client(client)?;
+
+        let filedata = FileData::get_map(&files);
+
+        // already sorted
+        let comparisons = gen_comparisons(filedata, metadata.as_map());
+
+        let mut healthy = true;
+        let mut finished_migrations = false;
+        for comparison in comparisons {
+            if let None = comparison.filesystem {
+                println!(
+                    "{}",
+                    format!(
+                        "no matching file found for record '{}'",
+                        comparison.table_row.unwrap().filename.yellow()
+                    )
+                    .red()
+                );
+                healthy = false;
+                return Ok(());
+            }
+            if let None = comparison.table_row {
+                finished_migrations = true;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn do_migration(
+        &self,
+        client: &mut postgres::Client,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let files = self.get_sorted_target_files()?;
         println!("Found target files:");
         util::print_iter(Box::new(
@@ -187,16 +247,22 @@ impl Migrator {
 
         for comparison in comparisons {
             if let None = comparison.filesystem {
-                eprintln!("{}", format!("no matching file found for record '{}'", comparison.table_row.unwrap().filename.yellow()).red());
-                return (Err(Box::new(std::io::Error::new(io::ErrorKind::InvalidData, "^"))));
+                eprintln!(
+                    "{}",
+                    format!(
+                        "no matching file found for record '{}'",
+                        comparison.table_row.unwrap().filename.yellow()
+                    )
+                    .red()
+                );
+                return (Err(Box::new(std::io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "^",
+                ))));
             }
             if let None = comparison.table_row {
                 // perform migration
-                Self::migrate_single_file(
-                    client,
-                    &comparison.filesystem.unwrap().path,
-                    &metadata,
-                )?;
+                Self::migrate_single_file(client, &comparison.filesystem.unwrap().path, &metadata)?;
             }
         }
         Ok(())
@@ -237,13 +303,20 @@ impl Migrator {
         Ok(())
     }
 
-    fn insert_metadata_row(tx: &mut postgres::Transaction, data: MetadataRow) -> Result<(), postgres::Error> {
+    fn insert_metadata_row(
+        tx: &mut postgres::Transaction,
+        data: MetadataRow,
+    ) -> Result<(), postgres::Error> {
         let query = "
             INSERT INTO samson_db_migrator_metadata (ts, filename, checksum) VALUES($1, $2, $3);
         ";
         tx.execute(
             query,
-            &[&chrono::Utc::now(), &&data.filename, &(data.checksum as i64)],
+            &[
+                &chrono::Utc::now(),
+                &&data.filename,
+                &(data.checksum as i64),
+            ],
         )?;
         Ok(())
     }

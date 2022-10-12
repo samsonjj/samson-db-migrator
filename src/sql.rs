@@ -20,3 +20,40 @@ fn get_connection_string(user: &str, password: &str, hostname: &str, database: &
         user, password, hostname, database
     )
 }
+
+use std::cell::RefCell;
+
+#[derive(Clone, Debug)]
+pub struct MetadataRow {
+    checksum: i32,
+    filename: String,
+    ts: chrono::DateTime<chrono::Utc>,
+}
+
+struct MetadataRepository {
+    client: RefCell<postgres::Client>,
+}
+
+impl MetadataRepository {
+    pub fn new(client: RefCell<postgres::Client>) -> Self {
+        Self { client }
+    }
+
+    fn insert_metadata_row(
+        tx: &mut postgres::Transaction,
+        data: MetadataRow,
+    ) -> Result<(), postgres::Error> {
+        let query = "
+            INSERT INTO samson_db_migrator_metadata (ts, filename, checksum) VALUES($1, $2, $3);
+        ";
+        tx.execute(
+            query,
+            &[
+                &chrono::Utc::now(),
+                &&data.filename,
+                &(data.checksum as i64),
+            ],
+        )?;
+        Ok(())
+    }
+}
