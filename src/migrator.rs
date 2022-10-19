@@ -1,129 +1,26 @@
-use chrono::{Date, DateTime, Utc};
+use chrono::{DateTime, Utc};
 use itertools::Itertools;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 use std::env;
-use std::fmt::Display;
 use std::fs::{self, FileType};
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
 
 use colored::Colorize;
 
-use postgres::{self, Client};
-
-use crate::sql;
-
+use crate::filesystem::FileData;
+use crate::sql::MetadataRow;
 use crate::util;
-
-#[derive(Clone, Debug)]
-pub struct MetadataRow {
-    checksum: i32,
-    filename: String,
-    ts: chrono::DateTime<chrono::Utc>,
-}
-
-macro_rules! row_format {
-    () => {
-        "{0: <30} | {1: <30} | {2: <10}"
-    };
-}
-
-impl MetadataRow {
-    pub fn print_headers() {
-        println!();
-        println!(row_format!(), "ts", "filename", "checksum",);
-        println!("------------------------------------------------------------------------------------------");
-    }
-    pub fn print_row(&self) {
-        println!(row_format!(), self.ts, self.filename, self.checksum);
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct FileData {
-    checksum: i32,
-    filename: String,
-    path: PathBuf,
-    ts: chrono::DateTime<chrono::Utc>,
-}
-
-impl FileData {
-    pub fn get_map(paths: &Vec<PathBuf>) -> HashMap<String, Self> {
-        paths
-            .iter()
-            .map(|path| {
-                (
-                    path.file_name().unwrap().to_str().unwrap().to_owned(),
-                    FileData {
-                        checksum: 0,
-                        filename: path.file_name().unwrap().to_str().unwrap().to_owned(),
-                        path: path.clone(),
-                        ts: Utc::now(),
-                    },
-                )
-            })
-            .collect()
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Metadata {
     pub rows: Vec<MetadataRow>,
 }
 
-impl Metadata {
-    pub fn from_postgres_client(client: &mut postgres::Client) -> Result<Self, postgres::Error> {
-        let query = "
-            SELECT ts, filename, checksum
-            FROM samson_db_migrator_metadata
-            ORDER BY ts
-        ";
-        let rows = client.query(query, &[])?;
-
-        let rows = rows
-            .iter()
-            .map(|row| MetadataRow {
-                ts: rows[0].get::<_, DateTime<Utc>>(0),
-                filename: row.get(1),
-                checksum: row.get::<_, i64>(2) as i32,
-            })
-            .collect();
-        Ok(Self { rows })
-    }
-
-    pub fn as_map(&self) -> HashMap<String, MetadataRow> {
-        self.rows
-            .iter()
-            .map(|row| (row.filename.clone(), row.clone()))
-            .collect()
-    }
-
-    pub fn init_metadata_table(client: &mut postgres::Client) -> Result<(), postgres::Error> {
-        let query = "
-            CREATE TABLE samson_db_migrator_metadata (
-                ts                  TIMESTAMP WITH TIME ZONE,
-                filename            TEXT,
-                checksum            BIGINT
-            );
-        ";
-        client.execute(query, &[])?;
-        println!(
-            "{}",
-            "initialized samson_db_migrator_metadata table".green()
-        );
-        Ok(())
-    }
-
-    pub fn remove_metadata_table(
-        client: &mut postgres::Client,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let query = "
-            DROP TABLE IF EXISTS samson_db_migrator_metadata
-        ";
-        client.execute(query, &[])?;
-        println!("{}", "removed samson_db_migrator_metadata table".red());
-        Ok(())
-    }
+pub fn as_map(rows: Vec<MetadataRow>) -> HashMap<String, MetadataRow> {
+    rows.iter()
+        .map(|row| (row.filename.clone(), row.clone()))
+        .collect()
 }
 
 /// Entrypoint for samson-db-migrator library, excluding cli
@@ -140,8 +37,8 @@ enum MigrationStatus {
 struct MetadataComparison {
     filename: String,
     table_row: Option<MetadataRow>,
-    filesystem: Option<FileData>,
-    status: Option<MigrationStatus>,
+    file_data: Option<FileData>,
+    status: MigrationStatus,
 }
 
 impl MetadataComparison {
@@ -149,8 +46,8 @@ impl MetadataComparison {
         Self {
             filename,
             table_row: None,
-            filesystem: None,
-            status: None,
+            file_data: None,
+            status: MigrationStatus::Unmigrated,
         }
     }
 }
@@ -159,12 +56,13 @@ fn gen_comparisons(
     filedata: HashMap<String, FileData>,
     metadata: HashMap<String, MetadataRow>,
 ) -> Vec<MetadataComparison> {
+    // collect file and database data
     let mut hm: HashMap<String, MetadataComparison> = HashMap::new();
     for (filename, data) in filedata {
         let entry = hm
             .entry(filename.clone())
             .or_insert(MetadataComparison::new(filename.clone()));
-        (*entry).filesystem = Some(data);
+        (*entry).file_data = Some(data);
     }
     for (filename, data) in metadata {
         let entry = hm
@@ -173,14 +71,28 @@ fn gen_comparisons(
         (*entry).table_row = Some(data);
     }
 
+    // store as sorted vec
     let keys = hm
         .keys()
         .sorted()
         .map(|k| k.clone())
         .collect::<Vec<String>>();
-    keys.iter()
+    let mut results = keys
+        .iter()
         .map(|k| hm.remove(k).unwrap())
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+
+    // compute status
+    for mut data in results.iter_mut() {
+        data.status = match (&data.file_data, &data.table_row) {
+            (Some(_), Some(_)) => MigrationStatus::Migrated,
+            (None, Some(_)) => MigrationStatus::FileMissing,
+            (Some(_), None) => MigrationStatus::Unmigrated,
+            _ => panic!("invalid comparison between files and database"),
+        }
+    }
+
+    results
 }
 
 impl Migrator {
@@ -196,17 +108,17 @@ impl Migrator {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let files = self.get_sorted_target_files()?;
 
-        let metadata = Metadata::from_postgres_client(client)?;
+        let metadata_rows = MetadataRow::get_rows(client)?;
 
         let filedata = FileData::get_map(&files);
 
         // already sorted
-        let comparisons = gen_comparisons(filedata, metadata.as_map());
+        let comparisons = gen_comparisons(filedata, as_map(metadata_rows));
 
         let mut healthy = true;
         let mut finished_migrations = false;
         for comparison in comparisons {
-            if let None = comparison.filesystem {
+            if let None = comparison.file_data {
                 println!(
                     "{}",
                     format!(
@@ -238,31 +150,42 @@ impl Migrator {
                 .map(|x| x.file_name().unwrap().to_str().unwrap().green()),
         ));
 
-        let metadata = Metadata::from_postgres_client(client)?;
+        let metadata_rows = MetadataRow::get_rows(client)?;
 
         let filedata = FileData::get_map(&files);
 
         // already sorted
-        let comparisons = gen_comparisons(filedata, metadata.as_map());
+        let comparisons = gen_comparisons(filedata, as_map(metadata_rows));
 
         for comparison in comparisons {
-            if let None = comparison.filesystem {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "no matching file found for record '{}'",
-                        comparison.table_row.unwrap().filename.yellow()
-                    )
-                    .red()
-                );
-                return (Err(Box::new(std::io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "^",
-                ))));
-            }
-            if let None = comparison.table_row {
-                // perform migration
-                Self::migrate_single_file(client, &comparison.filesystem.unwrap().path, &metadata)?;
+            match comparison.status {
+                MigrationStatus::FileMissing => {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "no matching file found for record '{}'",
+                            comparison.table_row.unwrap().filename.yellow()
+                        )
+                        .red()
+                    );
+                    return (Err(Box::new(std::io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "^",
+                    ))));
+                }
+                MigrationStatus::Unmigrated => {
+                    // perform migration
+                    Self::migrate_single_file(
+                        client,
+                        &comparison.file_data.as_ref().unwrap(),
+                    )?;
+                }
+                MigrationStatus::Migrated => {
+                    println!(
+                        "already migrated {:?}",
+                        comparison.file_data.unwrap().filename
+                    );
+                }
             }
         }
         Ok(())
@@ -270,26 +193,37 @@ impl Migrator {
 
     fn migrate_single_file(
         client: &mut postgres::Client,
-        path: &PathBuf,
-        metadata: &Metadata,
+        file_data: &FileData,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        dbg!();
+        // execute sql file
         let mut tx = client.transaction()?;
-        dbg!();
-        Self::execute_sql_script(&mut tx, path)?;
+        Self::execute_sql_script(&mut tx, &file_data.path)?;
+
+        // insert sql row
         let data = MetadataRow {
             checksum: 0,
-            filename: path.file_name().unwrap().to_owned().into_string().unwrap(),
+            filename: file_data
+                .path
+                .file_name()
+                .unwrap()
+                .to_owned()
+                .into_string()
+                .unwrap(),
             ts: chrono::Utc::now(),
         };
-        dbg!();
-        Self::insert_metadata_row(&mut tx, data)?;
-        dbg!();
+
+        MetadataRow::from(file_data).insert(&mut tx);
+
+        // commit
         tx.commit()?;
-        dbg!();
+
         println!(
             "{}",
-            format!("successfully migrated {:?}", path.file_name().unwrap()).green()
+            format!(
+                "successfully migrated {:?}",
+                file_data.path.file_name().unwrap()
+            )
+            .green()
         );
         Ok(())
     }
@@ -300,24 +234,6 @@ impl Migrator {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let query = fs::read_to_string(path)?;
         tx.execute(&query, &[])?;
-        Ok(())
-    }
-
-    fn insert_metadata_row(
-        tx: &mut postgres::Transaction,
-        data: MetadataRow,
-    ) -> Result<(), postgres::Error> {
-        let query = "
-            INSERT INTO samson_db_migrator_metadata (ts, filename, checksum) VALUES($1, $2, $3);
-        ";
-        tx.execute(
-            query,
-            &[
-                &chrono::Utc::now(),
-                &&data.filename,
-                &(data.checksum as i64),
-            ],
-        )?;
         Ok(())
     }
 
